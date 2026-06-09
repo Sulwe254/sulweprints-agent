@@ -2,3 +2,4 @@ pytrends
 groq
 google-generativeai
 requests
+oauthlib
