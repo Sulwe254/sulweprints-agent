@@ -1,0 +1,4 @@
+pytrends
+groq
+google-generativeai
+requests
