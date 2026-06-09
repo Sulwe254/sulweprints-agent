@@ -1,25 +1,33 @@
 """
-SulwePrints Ultimate Marketing Agent v2.0
-==========================================
-A fully automated AI marketing agent that:
-- Researches trending World Cup digital products
-- Writes attention-grabbing copy using proven marketing frameworks
-- Auto-promotes on Discord, Medium, Pinterest, Twitter/X, and Facebook Pages
-- Sends you a Daily Marketing Brief via Telegram DM
-- Never gets banned (avoids Reddit, avoids Groups spamming)
+SulwePrints Auto-Engagement Agent v3.0
+========================================
+This agent FINDS people already talking about World Cup sweepstakes/pools
+and ENGAGES them with genuinely helpful replies that naturally promote your product.
 
-Mistakes fixed from v1:
-- No Reddit auto-posting (caused bans)
-- No Markdown in Telegram (caused message rejection)
-- No Facebook Groups (caused bans) — uses Facebook Pages instead
-- No generic copy — uses AIDA/PAS marketing frameworks
-- No single AI fallback — tries Groq -> Gemini -> local fallback
+NO creating channels. NO building audiences. NO manual posting.
+The bot goes WHERE THE PEOPLE ALREADY ARE.
+
+AUTO-ENGAGEMENT PLATFORMS:
+1. Reddit — Searches subreddits, finds questions, replies helpfully
+2. Twitter/X — Searches tweets, replies to people asking about pools
+3. Mastodon — Searches the fediverse, engages with relevant posts
+
+SAFETY RULES (learned from past mistakes):
+- NEVER post direct links on Reddit (causes bans)
+- NEVER sound like a marketer (causes bans)
+- ALWAYS be genuinely helpful first
+- ONLY mention product casually, like a fan sharing a find
+- MAX 1 reply per platform per run (avoids spam detection)
+- Track replied posts to never reply twice
+- Rate limit strictly
 """
 
 import os
 import re
 import json
 import requests
+import time
+import random
 from datetime import datetime
 from pytrends.request import TrendReq
 
@@ -36,9 +44,15 @@ try:
 except ImportError:
     HAS_GEMINI = False
 
+try:
+    import praw
+    HAS_PRAW = True
+except ImportError:
+    HAS_PRAW = False
+
 
 # ============================================================
-# CONFIGURATION — All secrets from GitHub Actions
+# CONFIGURATION
 # ============================================================
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -46,17 +60,22 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 MY_PERSONAL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 PAYHIP_LINK = os.environ.get("PAYHIP_LINK", "https://payhip.com/b/l1ZIk")
 
-# Platform secrets (all optional — agent works with whatever you set up)
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-MEDIUM_API_TOKEN = os.environ.get("MEDIUM_API_TOKEN", "")
-PINTEREST_ACCESS_TOKEN = os.environ.get("PINTEREST_ACCESS_TOKEN", "")
-PINTEREST_BOARD_ID = os.environ.get("PINTEREST_BOARD_ID", "")
+# Reddit credentials (free at reddit.com/prefs/apps)
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME", "")
+REDDIT_PASSWORD = os.environ.get("REDDIT_PASSWORD", "")
+
+# Twitter/X (free tier)
+TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "")
 TWITTER_API_KEY = os.environ.get("TWITTER_API_KEY", "")
 TWITTER_API_SECRET = os.environ.get("TWITTER_API_SECRET", "")
 TWITTER_ACCESS_TOKEN = os.environ.get("TWITTER_ACCESS_TOKEN", "")
 TWITTER_ACCESS_SECRET = os.environ.get("TWITTER_ACCESS_SECRET", "")
-FACEBOOK_PAGE_TOKEN = os.environ.get("FACEBOOK_PAGE_TOKEN", "")
-FACEBOOK_PAGE_ID = os.environ.get("FACEBOOK_PAGE_ID", "")
+
+# Mastodon (free)
+MASTODON_INSTANCE = os.environ.get("MASTODON_INSTANCE", "mastodon.social")
+MASTODON_ACCESS_TOKEN = os.environ.get("MASTODON_ACCESS_TOKEN", "")
 
 # Product info
 PRODUCT_NAME = "2026 Global Football Tournament Sweepstake Kit"
@@ -66,30 +85,124 @@ PRODUCT_DESC = (
     "payout tracker, winner & wooden spoon certificates — instant PDF download"
 )
 
+# Track what we've already replied to (stored in a simple file)
+REPLIED_FILE = "replied_posts.json"
+
 
 # ============================================================
-# 1. TREND RESEARCH ENGINE
+# 0. UTILITY FUNCTIONS
+# ============================================================
+def sanitize_text(text):
+    """Remove ALL markdown/formatting that could crash any platform."""
+    clean = text
+    for char in ["*", "_", "~", "`", "#", "|", ">"]:
+        clean = clean.replace(char, "")
+    clean = re.sub(r'\n{3,}', '\n\n', clean)
+    clean = clean.strip()
+    return clean
+
+
+def load_replied_posts():
+    """Load the list of posts we've already replied to."""
+    try:
+        with open(REPLIED_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"reddit": [], "twitter": [], "mastodon": []}
+
+
+def save_replied_posts(data):
+    """Save the list of replied posts."""
+    # Keep only last 200 entries per platform to prevent file from growing forever
+    for platform in data:
+        data[platform] = data[platform][-200:]
+    with open(REPLIED_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+def ai_generate(prompt, temperature=0.8):
+    """Generate text using Groq -> Gemini fallback."""
+    system_prompt = (
+        "You are a genuine football fan and sweepstake enthusiast. You are NOT a marketer. "
+        "You are NOT a salesperson. You are a real person who loves football and organizes "
+        "office pools every tournament. You found a great kit that saved you time and you "
+        "casually mention it the way a friend would recommend something — never pushy, "
+        "never salesy. You write like you talk: casual, helpful, enthusiastic but authentic. "
+        "You never use marketing language like 'amazing', 'revolutionary', 'game-changer'. "
+        "You use words like 'handy', 'solid', 'pretty useful', 'made things easier'."
+    )
+
+    if HAS_GROQ and GROQ_API_KEY:
+        try:
+            print("⚡ Trying Groq...")
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama3-8b-8192",
+                temperature=temperature,
+                max_tokens=1024,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"  Groq failed: {e}")
+
+    if HAS_GEMINI and GEMINI_API_KEY:
+        try:
+            print("🔮 Falling back to Gemini...")
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel('gemini-pro')
+            response = model.generate_content(f"{system_prompt}\n\n{prompt}")
+            return response.text
+        except Exception as e:
+            print(f"  Gemini failed: {e}")
+
+    return "I found a pretty handy sweepstake kit that made my office pool way easier to set up."
+
+
+def send_telegram(message):
+    """Send DM to user via Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not MY_PERSONAL_ID:
+        print("⚠️ Telegram not configured")
+        return False
+
+    print(f"📱 Sending Telegram DM...")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    clean = sanitize_text(message)
+
+    # Split if too long
+    chunks = [clean[i:i+4000] for i in range(0, len(clean), 4000)] if len(clean) > 4000 else [clean]
+
+    for chunk in chunks:
+        try:
+            requests.post(url, json={"chat_id": MY_PERSONAL_ID, "text": chunk}, timeout=30)
+        except Exception as e:
+            print(f"  Telegram error: {e}")
+    return True
+
+
+# ============================================================
+# 1. TREND RESEARCH
 # ============================================================
 def check_trends():
-    """Research trending keywords across multiple categories."""
+    """Research what's trending around World Cup sweepstakes."""
     print("🔍 Researching trends...")
-
     results = {
         "top_countries": ["Global"],
-        "trending_promo": [],
         "trending_ideas": [],
         "rising_searches": [],
-        "related_queries": [],
     }
 
     try:
         pytrends = TrendReq(hl='en-US', tz=360)
 
-        # Category 1: Core product keywords
+        # Core product trends
         promo_keywords = [
             "football sweepstake", "world cup office pool",
-            "2026 football kit", "world cup sweepstake kit",
-            "football tournament bracket"
+            "world cup sweepstake kit", "football tournament bracket",
+            "world cup predictor"
         ]
         pytrends.build_payload(promo_keywords, cat=0, timeframe='now 7-d', geo='', gprop='')
         promo_data = pytrends.interest_by_region(resolution='COUNTRY')
@@ -101,12 +214,12 @@ def check_trends():
                 .index.tolist()
             )
 
-        # Category 2: Product expansion ideas
+        # Product idea trends
         idea_keywords = [
-            "world cup bingo", "world cup wallpaper",
-            "world cup bracket", "world cup quiz",
-            "sweepstake template", "world cup predictor game",
-            "football pool spreadsheet", "world cup sticker album"
+            "world cup bingo", "world cup bracket",
+            "world cup quiz", "sweepstake template",
+            "football pool spreadsheet", "world cup predictor game",
+            "world cup sticker album", "world cup wall chart"
         ]
         pytrends.build_payload(idea_keywords, cat=0, timeframe='now 7-d', geo='', gprop='')
         idea_data = pytrends.interest_over_time()
@@ -116,11 +229,10 @@ def check_trends():
                     latest = idea_data[kw].iloc[-1]
                     if latest > 30:
                         results["trending_ideas"].append({
-                            "keyword": kw,
-                            "score": int(latest)
+                            "keyword": kw, "score": int(latest)
                         })
 
-        # Category 3: Rising related searches
+        # Rising searches
         pytrends.build_payload(
             ["world cup 2026", "football tournament 2026"],
             cat=0, timeframe='now 7-d', geo='', gprop=''
@@ -128,577 +240,602 @@ def check_trends():
         related = pytrends.related_queries()
         for kw, data in related.items():
             if data.get("rising") is not None and not data["rising"].empty:
-                top_rising = data["rising"].head(5)
-                for _, row in top_rising.iterrows():
-                    results["rising_searches"].append(
-                        f"{row['query']} ({row.get('value', 'rising')})"
-                    )
+                for _, row in data["rising"].head(5).iterrows():
+                    results["rising_searches"].append(str(row['query']))
 
     except Exception as e:
-        print(f"⚠️ Trend error: {e}")
+        print(f"  Trend error: {e}")
 
-    # Sort trending ideas by score
     results["trending_ideas"].sort(key=lambda x: x["score"], reverse=True)
-
     return results
 
 
 def research_digital_products(trend_data):
-    """Use AI to research what World Cup digital products are trending and worth making."""
+    """Research what World Cup digital products are trending."""
     print("📦 Researching trending digital products...")
-
     ideas_str = ", ".join(
-        f"{i['keyword']} (trend: {i['score']})" for i in trend_data["trending_ideas"]
+        f"{i['keyword']} ({i['score']})" for i in trend_data["trending_ideas"]
     ) if trend_data["trending_ideas"] else "None detected"
-    rising_str = ", ".join(trend_data["rising_searches"][:8]) if trend_data["rising_searches"] else "None"
-    countries_str = ", ".join(trend_data["top_countries"][:3])
+    rising_str = ", ".join(trend_data["rising_searches"][:5]) if trend_data["rising_searches"] else "None"
 
-    prompt = f"""You are a digital product research expert. Analyze these Google Trends signals and recommend the BEST digital products to create and sell around the 2026 World Cup / Football Tournament.
+    prompt = f"""You are a digital product research expert. Based on these trends, recommend the 3 BEST digital products to make and sell around the 2026 World Cup.
 
-CURRENT TREND DATA:
-- Trending product ideas: {ideas_str}
+TREND DATA:
+- Trending ideas: {ideas_str}
 - Rising searches: {rising_str}
-- Hot countries: {countries_str}
-- Existing product: {PRODUCT_NAME} ({PRODUCT_PRICE}) — {PRODUCT_DESC}
+- My current product: {PRODUCT_NAME} ({PRODUCT_PRICE}) — {PRODUCT_DESC}
 
-REQUIREMENTS:
-1. Recommend exactly 3 digital products that are EASY to make as PDFs (can be made in Canva or Google Docs in under 2 hours)
-2. Each product must have proven demand based on the trend data
-3. Suggest a price point for each (between $2.99 and $9.99)
-4. Explain WHY it will sell (what trend supports it)
-5. Give a one-sentence marketing hook for each product
+For each product, give:
+1. PRODUCT NAME
+2. PRICE ($2.99 - $9.99)
+3. WHY IT WILL SELL (what trend backs it)
+4. HOOK (one attention-grabbing sentence, not salesy)
+5. TIME TO MAKE (minutes, using Canva or Google Docs)
 
-FORMAT for each product:
-PRODUCT: [name]
-PRICE: [suggested price]
-WHY IT SELLS: [trend-backed reason]
-HOOK: [attention-grabbing one-liner]
-TIME TO MAKE: [estimated minutes]"""
+Keep it concise. No markdown. No asterisks."""
 
-    return ai_generate(prompt)
+    return ai_generate(prompt, temperature=0.7)
 
 
 # ============================================================
-# 2. AI COPYWRITING ENGINE (Proven Marketing Frameworks)
+# 2. REDDIT AUTO-ENGAGEMENT
 # ============================================================
-def ai_generate(prompt, max_retries=2):
-    """Generate text using Groq -> Gemini fallback chain."""
-    # Try Groq first (fastest)
-    if HAS_GROQ and GROQ_API_KEY:
-        try:
-            print("⚡ Trying Groq...")
-            client = Groq(api_key=GROQ_API_KEY)
-            response = client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a world-class direct-response copywriter and digital marketing strategist. "
-                            "You write copy that stops scrolling, triggers emotion, and drives action. "
-                            "You use proven frameworks like AIDA (Attention-Interest-Desire-Action) and "
-                            "PAS (Problem-Agitate-Solution). You never use generic marketing speak. "
-                            "Every word earns its place. You sound like a real fan who happens to sell something great."
-                        )
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama3-8b-8192",
-                temperature=0.8,
-                max_tokens=2048,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"⚠️ Groq failed: {e}")
+# Subreddits where people discuss sweepstakes, office pools, football
+REDDIT_SUBREDDITS = [
+    "soccer", "football", "worldcup", "sportsbook",
+    "fantasypl", "soccerbetting", "premierleague",
+    "AskReddit", "onylusefulwebsites", "coolwebsites",
+]
 
-    # Fallback to Gemini
-    if HAS_GEMINI and GEMINI_API_KEY:
-        try:
-            print("🔮 Falling back to Gemini...")
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel('gemini-pro')
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            print(f"⚠️ Gemini failed: {e}")
-
-    # Last resort: structured fallback
-    print("🆘 Using fallback copy...")
-    return (
-        f"🔥 {PRODUCT_NAME} — {PRODUCT_PRICE}\n\n"
-        f"Get your tournament sorted in 5 minutes: {PRODUCT_DESC}\n\n"
-        f"Grab yours: {PAYHIP_LINK}"
-    )
+# Search queries to find people asking about pools/sweepstakes
+REDDIT_SEARCH_QUERIES = [
+    "world cup sweepstake",
+    "world cup office pool",
+    "football sweepstake kit",
+    "how to run a world cup pool",
+    "world cup 2026 bracket",
+    "football tournament predictor",
+    "world cup betting pool",
+    "sweepstake template",
+]
 
 
-def generate_social_post(trend_data):
-    """Generate an attention-grabbing social media post using AIDA framework."""
-    countries = ", ".join(trend_data["top_countries"][:3])
-    ideas = trend_data["trending_ideas"][:2]
+def reddit_find_and_reply(trend_data):
+    """Search Reddit for relevant posts and reply with genuinely helpful comments."""
+    if not HAS_PRAW or not all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD]):
+        print("⚠️ Reddit not configured, skipping")
+        return None
 
-    prompt = f"""Write a social media post that stops people from scrolling. Use the AIDA framework (Attention-Interest-Desire-Action).
-
-PRODUCT: {PRODUCT_NAME}
-PRICE: {PRODUCT_PRICE}
-WHAT IT INCLUDES: {PRODUCT_DESC}
-LINK: {PAYHIP_LINK}
-HOT MARKETS: {countries}
-
-RULES:
-- Start with a HOOK that creates FOMO or curiosity (NOT "Check out my product")
-- Make it sound like a passionate fan, NOT a salesperson
-- Use 2-3 emojis max (not emoji soup)
-- Include a specific detail that proves this kit saves time (e.g., "5 minutes to set up")
-- End with a clear call-to-action
-- Keep it under 280 characters for Twitter compatibility
-- Do NOT use asterisks, underscores, tildes, or hashtags
-- Write in plain text only"""
-
-    return ai_generate(prompt)
-
-
-def generate_medium_article(trend_data):
-    """Generate an SEO-optimized Medium article that subtly promotes the product."""
-    countries = ", ".join(trend_data["top_countries"][:3])
-    ideas_str = ", ".join(i["keyword"] for i in trend_data["trending_ideas"][:3]) if trend_data["trending_ideas"] else "tournament brackets"
-
-    prompt = f"""Write a Medium article that will rank on Google and drive traffic to a product. Use the PAS framework (Problem-Agitate-Solution).
-
-PRODUCT: {PRODUCT_NAME} — {PRODUCT_PRICE}
-LINK: {PAYHIP_LINK}
-TARGET COUNTRIES: {countries}
-TRENDING TOPICS: {ideas_str}
-
-STRUCTURE:
-1. TITLE: Click-worthy but not clickbait. Include "2026" and "World Cup" or "Football Tournament"
-2. INTRO (2-3 sentences): State the problem — organizing a tournament pool is chaos
-3. AGITATION (2-3 sentences): Paint the pain — spreadsheets break, people argue over rules, someone always loses track
-4. SOLUTION (3-4 sentences): Present the kit as the answer. Mention specific features. Link to product.
-5. BONUS TIPS (3 bullet points): Give genuine value — best scoring systems, how to handle 48 teams, payout ideas
-
-RULES:
-- Sound like an experienced office pool organizer, NOT a marketer
-- The product mention should feel natural, like a recommendation from a friend
-- Include the link ONCE, naturally in the solution section
-- Do NOT use markdown formatting (no **, no __, no ##)
-- Keep total length under 400 words
-- Make it genuinely useful so Medium doesn't flag it as spam"""
-
-    return ai_generate(prompt)
-
-
-def generate_pinterest_description(trend_data):
-    """Generate a Pinterest-optimized pin description with SEO keywords."""
-    ideas_str = ", ".join(i["keyword"] for i in trend_data["trending_ideas"][:3]) if trend_data["trending_ideas"] else ""
-
-    prompt = f"""Write a Pinterest pin description for this product. Pinterest is a visual search engine, so this needs SEO keywords.
-
-PRODUCT: {PRODUCT_NAME} — {PRODUCT_PRICE}
-LINK: {PAYHIP_LINK}
-INCLUDES: {PRODUCT_DESC}
-RELATED TRENDS: {ideas_str}
-
-RULES:
-- First line must be hook-worthy (this shows up in the feed)
-- Include 5-8 relevant keywords naturally (world cup sweepstake, football pool kit, tournament bracket, etc.)
-- Mention it's an instant PDF download
-- End with the link
-- No markdown, no hashtags, no asterisks
-- Keep under 500 characters"""
-
-    return ai_generate(prompt)
-
-
-def generate_smart_reply(trend_data):
-    """Generate a smart, helpful reply for community questions (Quora, forums, etc.)."""
-    prompt = f"""Write a helpful answer to: "How do I run a World Cup office pool with 48 teams?"
-
-You are a genuine football fan who has organized pools before. You are NOT selling anything — you are being helpful.
-
-PRODUCT CONTEXT (mention ONCE at the very end, casually): {PRODUCT_NAME} — {PAYHIP_LINK}
-
-RULES:
-- Give genuinely useful advice (3-4 specific tips)
-- Sound like a real person, not AI
-- Mention the kit at the very end as a "by the way, this saved me time" — not a sales pitch
-- Do NOT use markdown, asterisks, or formatting
-- Keep under 200 words
-- If someone read this on Quora, they would upvote it because it's genuinely helpful"""
-
-    return ai_generate(prompt)
-
-
-def generate_daily_brief(trend_data, product_research):
-    """Generate the comprehensive Daily Marketing Brief sent to Telegram."""
-    countries = ", ".join(trend_data["top_countries"][:5])
-    ideas = trend_data["trending_ideas"]
-    ideas_str = ", ".join(f"{i['keyword']} ({i['score']})" for i in ideas[:5]) if ideas else "None today"
-
-    prompt = f"""You are an elite marketing strategist. Create a DAILY MARKETING BRIEF for a solo digital marketer selling a World Cup PDF kit.
-
-PRODUCT: {PRODUCT_NAME} — {PRODUCT_PRICE}
-LINK: {PAYHIP_LINK}
-WHAT IT INCLUDES: {PRODUCT_DESC}
-
-TODAY'S DATA:
-- Hot Markets: {countries}
-- Trending Product Ideas: {ideas_str}
-- Rising Searches: {', '.join(trend_data['rising_searches'][:5]) if trend_data['rising_searches'] else 'None'}
-
-PRODUCT RESEARCH RESULTS:
-{product_research}
-
-Create the brief with these EXACT sections:
-
-MARKETS ON FIRE: List the top 3 countries and WHERE to find buyers in each (specific Facebook Pages, subreddits for manual posting, Quora topics, local forums). Be specific — not "post on Facebook" but "post on the 'World Cup 2026 Fans' Facebook Page".
-
-TRENDING PRODUCT OPPORTUNITIES: Summarize the top 2 digital products to make next based on the research. Give a 1-sentence hook for each.
-
-TODAY'S COPY-AND-PASTE POST: Write ONE ready-to-post social update that would make someone click. Use the PAS formula (Problem-Agitate-Solution). No generic language. Include the link.
-
-SMART COMMUNITY REPLY: Write a 3-sentence helpful reply to "What's the best way to organize a football sweepstake?" that naturally mentions the kit at the end. Must sound like a real fan.
-
-DAILY ACTION PLAN: Give exactly 3 specific tasks to do today (e.g., "Post the social update in X Facebook Page", "Answer 2 Quora questions with the smart reply", "Create a World Cup Bingo PDF")
-
-RULES:
-- No markdown, no asterisks, no underscores, no tildes, no hashtags
-- Use plain text only
-- Use line breaks for readability
-- Every recommendation must be specific and actionable
-- No fluff — every word must earn its place"""
-
-    return ai_generate(prompt)
-
-
-# ============================================================
-# 3. MULTI-PLATFORM AUTO-POSTING ENGINE
-# ============================================================
-def sanitize_text(text):
-    """Remove ALL characters that could break Telegram, Discord, or any platform."""
-    # Remove markdown formatting characters
-    clean = text
-    clean = clean.replace("*", "")
-    clean = clean.replace("_", "")
-    clean = clean.replace("~", "")
-    clean = clean.replace("`", "")
-    clean = clean.replace("#", "")
-    # Remove extra whitespace
-    clean = re.sub(r'\n{3,}', '\n\n', clean)
-    clean = clean.strip()
-    return clean
-
-
-def post_to_telegram(message):
-    """Send DM to the user via Telegram (primary channel)."""
-    if not TELEGRAM_BOT_TOKEN or not MY_PERSONAL_ID:
-        print("⚠️ Telegram not configured, skipping")
-        return False
-
-    print(f"📱 Sending Telegram DM to {MY_PERSONAL_ID}...")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    clean_message = sanitize_text(message)
-
-    # Split long messages (Telegram limit is 4096 chars)
-    if len(clean_message) > 4000:
-        chunks = [clean_message[i:i+4000] for i in range(0, len(clean_message), 4000)]
-    else:
-        chunks = [clean_message]
-
-    success = True
-    for i, chunk in enumerate(chunks):
-        payload = {
-            "chat_id": MY_PERSONAL_ID,
-            "text": chunk
-        }
-        try:
-            response = requests.post(url, json=payload, timeout=30)
-            if response.status_code == 200:
-                print(f"  ✅ Telegram chunk {i+1}/{len(chunks)} sent")
-            else:
-                print(f"  ❌ Telegram chunk {i+1} failed: {response.text[:200]}")
-                success = False
-        except Exception as e:
-            print(f"  ❌ Telegram error: {e}")
-            success = False
-
-    return success
-
-
-def post_to_discord(message):
-    """Post to Discord channel via webhook (free, no moderation issues)."""
-    if not DISCORD_WEBHOOK_URL:
-        print("⚠️ Discord not configured, skipping")
-        return False
-
-    print("💬 Posting to Discord...")
-    clean_message = sanitize_text(message)
-
-    # Discord embed makes posts look professional
-    payload = {
-        "username": "SulwePrints Agent",
-        "embeds": [{
-            "title": f"Daily Marketing Brief — {datetime.now().strftime('%b %d, %Y')}",
-            "description": clean_message[:2000],
-            "color": 5763719,  # Green
-            "footer": {"text": "SulwePrints AI Agent"}
-        }]
-    }
+    print("🔎 Searching Reddit for conversations to engage...")
 
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-        if response.status_code == 204:
-            print("  ✅ Discord posted")
-            return True
-        else:
-            print(f"  ❌ Discord failed: {response.status_code} {response.text[:200]}")
-            return False
-    except Exception as e:
-        print(f"  ❌ Discord error: {e}")
-        return False
-
-
-def post_to_medium(article_text, title):
-    """Publish an SEO article to Medium (drives Google traffic for months)."""
-    if not MEDIUM_API_TOKEN:
-        print("⚠️ Medium not configured, skipping")
-        return False
-
-    print("📝 Publishing to Medium...")
-    try:
-        # Step 1: Get user ID
-        headers = {
-            "Authorization": f"Bearer {MEDIUM_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        user_resp = requests.get("https://api.medium.com/v1/me", headers=headers, timeout=30)
-        if user_resp.status_code != 200:
-            print(f"  ❌ Medium auth failed: {user_resp.status_code}")
-            return False
-
-        user_id = user_resp.json()["data"]["id"]
-
-        # Step 2: Publish article as draft (safe — won't get flagged)
-        publish_data = {
-            "title": sanitize_text(title),
-            "contentFormat": "plain",
-            "content": sanitize_text(article_text),
-            "tags": ["World Cup", "Football", "Sports", "Sweepstake", "2026"],
-            "publishStatus": "draft"  # Draft first — you review then publish manually
-        }
-        pub_resp = requests.post(
-            f"https://api.medium.com/v1/users/{user_id}/posts",
-            headers=headers,
-            json=publish_data,
-            timeout=30
+        reddit = praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            username=REDDIT_USERNAME,
+            password=REDDIT_PASSWORD,
+            user_agent="SulwePrintsHelper/1.0 (helpful football fan bot)"
         )
 
-        if pub_resp.status_code == 201:
-            post_url = pub_resp.json()["data"]["url"]
-            print(f"  ✅ Medium draft created: {post_url}")
-            return True
-        else:
-            print(f"  ❌ Medium publish failed: {pub_resp.status_code} {pub_resp.text[:200]}")
-            return False
+        # Verify authentication
+        reddit.user.me()
+
     except Exception as e:
-        print(f"  ❌ Medium error: {e}")
-        return False
+        print(f"  ❌ Reddit auth failed: {e}")
+        return None
 
+    replied = load_replied_posts()
+    best_post = None
+    best_score = 0
 
-def post_to_pinterest(description):
-    """Create a Pin on Pinterest (huge for visual/PDF products)."""
-    if not PINTEREST_ACCESS_TOKEN or not PINTEREST_BOARD_ID:
-        print("⚠️ Pinterest not configured, skipping")
-        return False
+    # Search across subreddits and queries
+    search_pairs = list(zip(
+        random.sample(REDDIT_SUBREDDITS, min(5, len(REDDIT_SUBREDDITS))),
+        random.sample(REDDIT_SEARCH_QUERIES, min(5, len(REDDIT_SEARCH_QUERIES)))
+    ))
 
-    print("📌 Pinning to Pinterest...")
+    for subreddit_name, query in search_pairs:
+        try:
+            subreddit = reddit.subreddit(subreddit_name)
+            for post in subreddit.search(query, sort="new", time_filter="week", limit=5):
+                # Skip if already replied
+                if post.id in replied["reddit"]:
+                    continue
+
+                # Skip stickied/mod posts
+                if post.stickied:
+                    continue
+
+                # Score = relevance (we prefer questions and new posts)
+                score = 0
+                title_lower = post.title.lower()
+                selftext_lower = (post.selftext or "").lower()
+
+                # Higher score for questions
+                if any(q in title_lower for q in ["how", "what", "where", "anyone", "help", "looking for", "recommend"]):
+                    score += 3
+
+                # Higher score for sweepstake/pool keywords
+                if any(kw in title_lower or kw in selftext_lower for kw in ["sweepstake", "office pool", "bracket", "predictor", "template"]):
+                    score += 3
+
+                # Prefer newer posts (less likely to be archived)
+                hours_old = (time.time() - post.created_utc) / 3600
+                if hours_old < 24:
+                    score += 2
+                elif hours_old < 72:
+                    score += 1
+
+                # Prefer posts with some engagement but not too much
+                if 1 <= post.num_comments <= 20:
+                    score += 1
+
+                if score > best_score:
+                    best_score = score
+                    best_post = post
+
+        except Exception as e:
+            print(f"  Search error in r/{subreddit_name}: {e}")
+            continue
+
+    if not best_post or best_score < 2:
+        print("  ℹ️ No good Reddit posts found this run")
+        return None
+
+    # Generate a genuinely helpful reply
+    post_title = best_post.title
+    post_body = (best_post.selftext or "")[:500]
+
+    prompt = f"""You are a real football fan on Reddit. You found this post and want to help:
+
+POST TITLE: {post_title}
+POST CONTENT: {post_body}
+
+Write a genuinely helpful comment. RULES:
+- Be AUTHENTIC. Sound like a real person, not AI or a marketer
+- Give ACTUAL useful advice first (2-3 specific tips about running a football pool/sweepstake)
+- At the very end, casually mention: "Found this sweepstake kit that made setup way easier — it's a PDF with 48 team cards and scoring systems" (adapt wording to feel natural)
+- DO NOT include any links (Reddit flags links as spam)
+- DO NOT mention the price
+- DO NOT use marketing words like "amazing", "best", "must-have"
+- DO NOT use markdown, asterisks, or formatting
+- Keep it under 150 words
+- If someone reads this, they should think "helpful fan" not "salesperson"
+- Write in a casual Reddit tone (contractions, friendly, not formal)"""
+
+    reply_text = ai_generate(prompt, temperature=0.9)
+
     try:
-        headers = {
-            "Authorization": f"Bearer {PINTEREST_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
+        # Post the reply
+        comment = best_post.reply(sanitize_text(reply_text))
+        print(f"  ✅ Replied on Reddit: r/{best_post.subreddit.display_name} — {post_title[:60]}")
+        print(f"  Link: https://reddit.com{comment.permalink}")
+
+        # Track this reply
+        replied["reddit"].append(best_post.id)
+        save_replied_posts(replied)
+
+        return {
+            "platform": "Reddit",
+            "subreddit": f"r/{best_post.subreddit.display_name}",
+            "title": post_title,
+            "link": f"https://reddit.com{best_post.permalink}",
+            "reply": reply_text[:200]
         }
-        pin_data = {
-            "board_id": PINTEREST_BOARD_ID,
-            "title": f"{PRODUCT_NAME} — Instant PDF Download",
-            "description": sanitize_text(description),
-            "link": PAYHIP_LINK,
-            "media_source": {
-                "source_type": "image_url",
-                # Use Payhip product image or create one with the AI image tool
-                "url": "https://payhip.com/b/l1ZIk"
-            }
-        }
-        resp = requests.post(
-            "https://api.pinterest.com/v5/pins",
-            headers=headers,
-            json=pin_data,
-            timeout=30
-        )
-        if resp.status_code == 201:
-            print("  ✅ Pinterest pin created")
-            return True
-        else:
-            print(f"  ❌ Pinterest failed: {resp.status_code} {resp.text[:200]}")
-            return False
+
     except Exception as e:
-        print(f"  ❌ Pinterest error: {e}")
-        return False
+        print(f"  ❌ Reddit reply failed: {e}")
+        # If rate limited or blocked, still track the post
+        replied["reddit"].append(best_post.id)
+        save_replied_posts(replied)
+        return None
 
 
-def post_to_twitter(tweet_text):
-    """Post a tweet using Twitter/X API v2 (free tier)."""
-    if not all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET]):
+# ============================================================
+# 3. TWITTER/X AUTO-ENGAGEMENT
+# ============================================================
+def twitter_find_and_reply(trend_data):
+    """Search Twitter for tweets about World Cup pools and reply."""
+    if not TWITTER_BEARER_TOKEN:
         print("⚠️ Twitter not configured, skipping")
-        return False
+        return None
 
-    print("🐦 Posting to Twitter/X...")
+    print("🐦 Searching Twitter for conversations...")
+
+    replied = load_replied_posts()
+    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+
+    # Search for recent tweets
+    search_queries = [
+        "world cup sweepstake",
+        "world cup office pool",
+        "football sweepstake 2026",
+        "world cup bracket pool",
+    ]
+    query = random.choice(search_queries)
+
     try:
-        # OAuth 1.0a signing
-        import oauthlib.oauth1
-        from urllib.parse import urlencode
+        # Search recent tweets (free tier: 1 request per 15 min)
+        search_url = "https://api.twitter.com/2/tweets/search/recent"
+        params = {
+            "query": f"{query} -is:retweet lang:en",
+            "max_results": 10,
+            "tweet.fields": "created_at,public_metrics,author_id",
+        }
+        response = requests.get(search_url, headers=headers, params=params, timeout=30)
 
-        oauth = oauthlib.oauth1.Client(
-            TWITTER_API_KEY,
-            client_secret=TWITTER_API_SECRET,
-            resource_owner_key=TWITTER_ACCESS_TOKEN,
-            resource_owner_secret=TWITTER_ACCESS_SECRET
-        )
+        if response.status_code != 200:
+            print(f"  ⚠️ Twitter search failed: {response.status_code}")
+            return None
 
-        clean_tweet = sanitize_text(tweet_text)[:280]  # Twitter limit
-        body = {"text": clean_tweet}
-        uri = "https://api.twitter.com/2/tweets"
+        tweets = response.json().get("data", [])
+        if not tweets:
+            print("  ℹ️ No tweets found")
+            return None
 
-        req_headers = {"Content-Type": "application/json"}
-        uri_with_params, signed_headers, _ = oauth.sign(
-            uri, http_method="POST", body=json.dumps(body), headers=req_headers
-        )
+        # Find the best tweet to reply to (most engaging, asking a question)
+        best_tweet = None
+        best_score = 0
 
-        response = requests.post(
-            uri, json=body, headers={**req_headers, **signed_headers}, timeout=30
-        )
-        if response.status_code == 201:
-            print("  ✅ Tweet posted")
-            return True
+        for tweet in tweets:
+            if tweet["id"] in replied["twitter"]:
+                continue
+
+            score = 0
+            text_lower = tweet["text"].lower()
+
+            # Prefer questions
+            if any(q in text_lower for q in ["how", "what", "anyone", "help", "looking"]):
+                score += 3
+
+            # Prefer sweepstake/pool content
+            if any(kw in text_lower for kw in ["sweepstake", "pool", "bracket", "predictor"]):
+                score += 2
+
+            # Prefer some engagement
+            metrics = tweet.get("public_metrics", {})
+            if metrics.get("like_count", 0) > 0 or metrics.get("reply_count", 0) > 0:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_tweet = tweet
+
+        if not best_tweet:
+            print("  ℹ️ No good tweets found this run")
+            return None
+
+        # Generate reply
+        prompt = f"""You are a real football fan on Twitter. You saw this tweet:
+
+TWEET: {best_tweet['text']}
+
+Write a short, helpful reply. RULES:
+- Be AUTHENTIC and casual (Twitter tone, use contractions)
+- Be genuinely helpful — give a quick tip or answer their question
+- At the end, casually say something like "I used this kit that made it super easy, it's a PDF with all 48 teams and scoring systems" — adapt to feel natural
+- DO NOT include links (Twitter flags automated links)
+- DO NOT use hashtags
+- DO NOT use marketing language
+- Keep under 200 characters if possible, max 280
+- No markdown, no asterisks"""
+
+        reply_text = ai_generate(prompt, temperature=0.9)
+        clean_reply = sanitize_text(reply_text)[:280]
+
+        # Post the reply (requires OAuth 1.0a for posting)
+        if all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET]):
+            import oauthlib.oauth1
+
+            oauth = oauthlib.oauth1.Client(
+                TWITTER_API_KEY,
+                client_secret=TWITTER_API_SECRET,
+                resource_owner_key=TWITTER_ACCESS_TOKEN,
+                resource_owner_secret=TWITTER_ACCESS_SECRET
+            )
+
+            body = {
+                "text": clean_reply,
+                "reply": {"in_reply_to_tweet_id": best_tweet["id"]}
+            }
+            uri = "https://api.twitter.com/2/tweets"
+            req_headers = {"Content-Type": "application/json"}
+            _, signed_headers, _ = oauth.sign(
+                uri, http_method="POST", body=json.dumps(body), headers=req_headers
+            )
+
+            post_resp = requests.post(
+                uri, json=body,
+                headers={**req_headers, **signed_headers},
+                timeout=30
+            )
+
+            if post_resp.status_code == 201:
+                print(f"  ✅ Replied on Twitter to: {best_tweet['text'][:60]}")
+                replied["twitter"].append(best_tweet["id"])
+                save_replied_posts(replied)
+                return {
+                    "platform": "Twitter",
+                    "tweet": best_tweet['text'][:100],
+                    "link": f"https://twitter.com/i/status/{best_tweet['id']}",
+                    "reply": clean_reply
+                }
+            else:
+                print(f"  ❌ Twitter reply failed: {post_resp.status_code} {post_resp.text[:200]}")
+                replied["twitter"].append(best_tweet["id"])
+                save_replied_posts(replied)
+                return None
         else:
-            print(f"  ❌ Twitter failed: {response.status_code} {response.text[:200]}")
-            return False
-    except ImportError:
-        print("  ⚠️ oauthlib not installed, skipping Twitter")
-        return False
+            # Can't post, but send the opportunity to user via Telegram
+            print("  ℹ️ Can't post to Twitter (no write credentials), sending opportunity to Telegram")
+            opp_msg = (
+                f"🐦 TWITTER OPPORTUNITY:\n"
+                f"Tweet: {best_tweet['text'][:200]}\n"
+                f"Link: https://twitter.com/i/status/{best_tweet['id']}\n"
+                f"Suggested reply: {clean_reply}"
+            )
+            send_telegram(opp_msg)
+            replied["twitter"].append(best_tweet["id"])
+            save_replied_posts(replied)
+            return {
+                "platform": "Twitter (manual)",
+                "tweet": best_tweet['text'][:100],
+                "link": f"https://twitter.com/i/status/{best_tweet['id']}",
+                "reply": clean_reply
+            }
+
     except Exception as e:
         print(f"  ❌ Twitter error: {e}")
-        return False
+        return None
 
 
-def post_to_facebook(message):
-    """Post to Facebook Page (NOT Groups — Pages don't get you banned)."""
-    if not FACEBOOK_PAGE_TOKEN or not FACEBOOK_PAGE_ID:
-        print("⚠️ Facebook Page not configured, skipping")
-        return False
+# ============================================================
+# 4. MASTODON AUTO-ENGAGEMENT
+# ============================================================
+def mastodon_find_and_reply(trend_data):
+    """Search Mastodon for relevant posts and engage."""
+    if not MASTODON_ACCESS_TOKEN:
+        print("⚠️ Mastodon not configured, skipping")
+        return None
 
-    print("📘 Posting to Facebook Page...")
-    clean_message = sanitize_text(message)
+    print("🦣 Searching Mastodon for conversations...")
+
+    replied = load_replied_posts()
+    headers = {"Authorization": f"Bearer {MASTODON_ACCESS_TOKEN}"}
+
+    search_queries = [
+        "world cup sweepstake",
+        "football office pool",
+        "world cup 2026 bracket",
+        "football sweepstake kit",
+    ]
+    query = random.choice(search_queries)
 
     try:
-        url = f"https://graph.facebook.com/v18.0/{FACEBOOK_PAGE_ID}/feed"
-        payload = {
-            "message": clean_message,
-            "link": PAYHIP_LINK,
-            "access_token": FACEBOOK_PAGE_TOKEN
+        # Search for posts
+        search_url = f"https://{MASTODON_INSTANCE}/api/v2/search"
+        params = {
+            "q": query,
+            "type": "statuses",
+            "limit": 10,
         }
-        response = requests.post(url, data=payload, timeout=30)
+        response = requests.get(search_url, headers=headers, params=params, timeout=30)
 
-        if response.status_code == 200:
-            post_id = response.json().get("id", "")
-            print(f"  ✅ Facebook Page post created: {post_id}")
-            return True
+        if response.status_code != 200:
+            print(f"  ⚠️ Mastodon search failed: {response.status_code}")
+            return None
+
+        statuses = response.json().get("statuses", [])
+        if not statuses:
+            print("  ℹ️ No Mastodon posts found")
+            return None
+
+        # Find the best post to reply to
+        best_status = None
+        best_score = 0
+
+        for status in statuses:
+            if status["id"] in replied["mastodon"]:
+                continue
+
+            score = 0
+            text_lower = status["content"].lower()
+
+            # Strip HTML for scoring
+            clean_text = re.sub(r'<[^>]+>', '', text_lower)
+
+            if any(q in clean_text for q in ["how", "what", "anyone", "help", "looking"]):
+                score += 3
+            if any(kw in clean_text for kw in ["sweepstake", "pool", "bracket", "predictor"]):
+                score += 2
+            if status.get("replies_count", 0) < 5:
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_status = status
+
+        if not best_status:
+            print("  ℹ️ No good Mastodon posts found this run")
+            return None
+
+        # Generate reply
+        clean_status = re.sub(r'<[^>]+>', '', best_status["content"])
+
+        prompt = f"""You are a real football fan on Mastodon. You saw this post:
+
+POST: {clean_status[:500]}
+
+Write a helpful reply. RULES:
+- Be AUTHENTIC and friendly (Mastodon has a warm, community tone)
+- Give genuinely useful advice first
+- Casually mention at the end: "Found this sweepstake kit that made my office pool way easier — has 48 team cards and scoring systems built in" — adapt wording naturally
+- You CAN include the link {PAYHIP_LINK} since Mastodon is more relaxed
+- DO NOT use marketing language
+- No markdown, no asterisks
+- Keep under 300 words"""
+
+        reply_text = ai_generate(prompt, temperature=0.9)
+        clean_reply = sanitize_text(reply_text)
+
+        # Post the reply
+        reply_url = f"https://{MASTODON_INSTANCE}/api/v1/statuses"
+        reply_data = {
+            "status": clean_reply,
+            "in_reply_to_id": best_status["id"],
+        }
+        post_resp = requests.post(reply_url, headers=headers, json=reply_data, timeout=30)
+
+        if post_resp.status_code == 200:
+            reply_url_result = post_resp.json().get("url", "")
+            print(f"  ✅ Replied on Mastodon: {clean_status[:60]}")
+            replied["mastodon"].append(best_status["id"])
+            save_replied_posts(replied)
+            return {
+                "platform": "Mastodon",
+                "post": clean_status[:100],
+                "link": best_status.get("url", ""),
+                "reply": clean_reply[:200]
+            }
         else:
-            print(f"  ❌ Facebook failed: {response.status_code} {response.text[:200]}")
-            return False
+            print(f"  ❌ Mastodon reply failed: {post_resp.status_code}")
+            replied["mastodon"].append(best_status["id"])
+            save_replied_posts(replied)
+            return None
+
     except Exception as e:
-        print(f"  ❌ Facebook error: {e}")
-        return False
+        print(f"  ❌ Mastodon error: {e}")
+        return None
 
 
 # ============================================================
-# 4. PLATFORM STATUS TRACKER
+# 5. WEB DISCOVERY — Find MORE places to engage
 # ============================================================
-def get_platform_status():
-    """Check which platforms are configured and ready."""
-    platforms = {
-        "Telegram DM": bool(TELEGRAM_BOT_TOKEN and MY_PERSONAL_ID),
-        "Discord": bool(DISCORD_WEBHOOK_URL),
-        "Medium": bool(MEDIUM_API_TOKEN),
-        "Pinterest": bool(PINTEREST_ACCESS_TOKEN and PINTEREST_BOARD_ID),
-        "Twitter/X": bool(all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET])),
-        "Facebook Page": bool(FACEBOOK_PAGE_TOKEN and FACEBOOK_PAGE_ID),
-    }
-    return platforms
+def discover_engagement_opportunities(trend_data):
+    """Use AI + trends to find WHERE people are talking about World Cup pools."""
+    print("🌍 Discovering engagement opportunities...")
+
+    ideas_str = ", ".join(i["keyword"] for i in trend_data["trending_ideas"][:3]) if trend_data["trending_ideas"] else "sweepstakes, pools"
+    countries = ", ".join(trend_data["top_countries"][:3])
+
+    prompt = f"""I sell a World Cup Sweepstake Kit PDF ({PRODUCT_PRICE}) — {PRODUCT_DESC}
+
+Based on these trending topics: {ideas_str}
+And these hot countries: {countries}
+
+List 5 SPECIFIC places online where real people are CURRENTLY discussing World Cup sweepstakes, office pools, or football brackets. For each:
+1. PLATFORM (Reddit subreddit, Facebook group name, Quora topic, forum URL, Discord server, etc.)
+2. WHAT THEY'RE DISKUSSING (the specific conversation happening)
+3. HOW TO ENGAGE (what to say that's genuinely helpful and naturally mentions my kit)
+4. THE LINK or search term to find it
+
+Focus on places where I can jump into EXISTING conversations — not create new posts.
+Be very specific (exact subreddit names, exact search queries, exact Quora questions).
+
+No markdown. No asterisks. Plain text only."""
+
+    return ai_generate(prompt, temperature=0.8)
 
 
 # ============================================================
-# 5. MAIN AGENT RUNNER
+# 6. DAILY BRIEF GENERATOR
+# ============================================================
+def generate_daily_brief(trend_data, product_research, engagement_results, discovery):
+    """Generate the comprehensive daily brief sent via Telegram."""
+    countries = ", ".join(trend_data["top_countries"][:5])
+    ideas = ", ".join(
+        f"{i['keyword']} ({i['score']})" for i in trend_data["trending_ideas"][:5]
+    ) if trend_data["trending_ideas"] else "None today"
+
+    # Build engagement summary
+    engage_summary = ""
+    for result in engagement_results:
+        if result:
+            engage_summary += f"\n  {result['platform']}: Replied to '{result.get('title', result.get('tweet', result.get('post', '')))[:60]}'"
+
+    if not engage_summary:
+        engage_summary = "\n  No auto-replies this run (no good conversations found or platforms not configured)"
+
+    brief = f"""SULWEPRINTS DAILY AGENT BRIEF
+{datetime.now().strftime('%A, %B %d, %Y %H:%M')}
+
+HOT MARKETS: {countries}
+
+TRENDING IDEAS: {ideas}
+
+AUTO-ENGAGEMENT RESULTS: {engage_summary}
+
+PRODUCT OPPORTUNITIES:
+{product_research[:1500]}
+
+WHERE TO ENGAGE NEXT (manual):
+{discovery[:1500]}
+
+Your kit: {PAYHIP_LINK}"""
+
+    return brief
+
+
+# ============================================================
+# 7. MAIN AGENT RUNNER
 # ============================================================
 def main():
-    print("=" * 50)
-    print(f"🚀 SulwePrints Agent v2.0 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("=" * 50)
+    print("=" * 55)
+    print(f"🚀 SulwePrints Agent v3.0 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"   Auto-Engagement Mode: Find people. Reply helpfully. Sell naturally.")
+    print("=" * 55)
 
     # Step 1: Research trends
     trend_data = check_trends()
-    print(f"  📍 Hot markets: {trend_data['top_countries'][:3]}")
-    print(f"  📦 Trending ideas: {[i['keyword'] for i in trend_data['trending_ideas'][:3]]}")
+    print(f"  Hot markets: {trend_data['top_countries'][:3]}")
+    print(f"  Trending ideas: {[i['keyword'] for i in trend_data['trending_ideas'][:3]]}")
 
     # Step 2: Research digital product opportunities
     product_research = research_digital_products(trend_data)
 
-    # Step 3: Generate all marketing content
-    print("\n✍️ Generating marketing content...")
+    # Step 3: AUTO-ENGAGE on all configured platforms
+    print("\n🤖 Auto-engaging on platforms...")
+    engagement_results = []
 
-    daily_brief = generate_daily_brief(trend_data, product_research)
-    social_post = generate_social_post(trend_data)
-    medium_article = generate_medium_article(trend_data)
-    pinterest_desc = generate_pinterest_description(trend_data)
-    smart_reply = generate_smart_reply(trend_data)
+    # Reddit (finds questions, replies helpfully)
+    reddit_result = reddit_find_and_reply(trend_data)
+    engagement_results.append(reddit_result)
 
-    # Extract a title for the Medium article
-    medium_title = f"How to Run a 48-Team World Cup Pool in 2026 (The Easy Way)"
+    # Twitter/X (finds tweets, replies)
+    twitter_result = twitter_find_and_reply(trend_data)
+    engagement_results.append(twitter_result)
 
-    # Step 4: Post to all configured platforms
-    print("\n📢 Auto-posting to platforms...")
-    results = {}
+    # Mastodon (finds posts, replies)
+    mastodon_result = mastodon_find_and_reply(trend_data)
+    engagement_results.append(mastodon_result)
 
-    # ALWAYS send the daily brief to Telegram DM
-    results["Telegram"] = post_to_telegram(daily_brief)
+    # Step 4: Discover more engagement opportunities
+    discovery = discover_engagement_opportunities(trend_data)
 
-    # Auto-post to platforms (only if configured)
-    results["Discord"] = post_to_discord(social_post)
-    results["Medium"] = post_to_medium(medium_article, medium_title)
-    results["Pinterest"] = post_to_pinterest(pinterest_desc)
-    results["Twitter"] = post_to_twitter(social_post)
-    results["Facebook"] = post_to_facebook(social_post)
+    # Step 5: Send daily brief via Telegram
+    print("\n📱 Compiling daily brief...")
+    brief = generate_daily_brief(trend_data, product_research, engagement_results, discovery)
+    send_telegram(brief)
 
-    # Step 5: Send platform status + smart reply as separate Telegram message
-    platform_status = get_platform_status()
-    status_lines = ["📊 PLATFORM STATUS:"]
-    for name, active in platform_status.items():
-        icon = "✅" if active else "⬜"
-        status_lines.append(f"  {icon} {name}")
+    # Step 6: Summary
+    print("\n" + "=" * 55)
+    print("📊 ENGAGEMENT RESULTS:")
+    active_platforms = 0
+    for result in engagement_results:
+        if result:
+            active_platforms += 1
+            print(f"  ✅ {result['platform']}: {result.get('title', result.get('tweet', result.get('post', '')))[:60]}")
+        else:
+            pass  # Skip unconfigured platforms
 
-    status_lines.append("\n💡 SMART REPLY (copy-paste for Quora/forums):")
-    status_lines.append(smart_reply)
+    if active_platforms == 0:
+        print("  ⬜ No platforms configured yet — add Reddit/Twitter/Mastodon to start!")
 
-    # Send product research as another message
-    status_lines.append("\n📦 PRODUCT RESEARCH:")
-    status_lines.append(product_research[:2000])
-
-    post_to_telegram("\n".join(status_lines))
-
-    # Final summary
-    print("\n" + "=" * 50)
-    print("📊 RESULTS:")
-    for platform, success in results.items():
-        icon = "✅" if success else "⬜"
-        print(f"  {icon} {platform}")
-    print("=" * 50)
+    print(f"\n  Active platforms: {active_platforms}/3")
+    print(f"  Platforms: Reddit={'✅' if HAS_PRAW and REDDIT_CLIENT_ID else '⬜'}, "
+          f"Twitter={'✅' if TWITTER_BEARER_TOKEN else '⬜'}, "
+          f"Mastodon={'✅' if MASTODON_ACCESS_TOKEN else '⬜'}")
+    print("=" * 55)
     print("🏁 Agent finished.")
 
 
