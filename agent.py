@@ -7,7 +7,6 @@ import google.generativeai as genai
 # --- LOAD SECRETS ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-NVIDIA_API_KEY = os.environ.get("NVIDIA_GLM_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 PAYHIP_LINK = os.environ.get("PAYHIP_LINK", "https://payhip.com/b/l1ZIk")
@@ -26,7 +25,7 @@ def check_trends():
         print(f"Trend error: {e}")
         return ["Global"]
 
-# --- 2. GENERATE POST (Try Groq -> NVIDIA -> Gemini) ---
+# --- 2. GENERATE POST (Try Groq first, then Gemini) ---
 def generate_post(countries):
     print(f"Generating post for: {countries}")
     
@@ -48,26 +47,6 @@ def generate_post(countries):
     except Exception as e:
         print(f"Groq failed: {e}")
     
-    # TRY NVIDIA SECOND
-    try:
-        print("Trying NVIDIA...")
-        url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        payload = {
-            "model": "meta/llama-3.1-8b-instruct",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 200
-        }
-        headers = {
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        return data['choices'][0]['message']['content']
-    except Exception as e:
-        print(f"NVIDIA failed: {e}")
-
     # FALLBACK TO GEMINI
     try:
         print("Falling back to Gemini...")
